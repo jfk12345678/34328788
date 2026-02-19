@@ -1,0 +1,652 @@
+<!DOCTYPE html>
+<html>
+
+<h1 style="text-align:center;">40m SDR receiver</h1>
+
+<p>
+This page allows you to tune within a 772kHz bandwidth that covers the 40m amateur radio band. For this receiver, the 40m band hits peak activity after sunset in PST. If you see no activity then either 1) it's daytime in PST or 2) propagation conditions are poor.
+</p>
+
+<p>
+This site is very experimental so don't expect it to work consistently.
+Also, this likely doesn't work on mobile so use a pc.
+</p>
+
+<hr>
+
+<img src="IMG_5364.jpg" style="width:500px;height:200px;"></img>
+
+<p>
+Above is a photo of the actual receiver.
+</p>
+
+<a href="howto.html">How do I use this website?</a>
+<br>
+<a href="howitworks.html">How does this website work?</a>
+
+<hr>
+
+<button id="start-audio">START AUDIO</button>
+
+<div class="tuner-body">
+	<div class="tuner">
+		<input id="tuned-frequency"></input>
+		<h4>kHz</h4>
+	</div>
+	
+	<button title="lower sideband" id="lsb">LSB</button>
+	<button title="upper sideband" id="usb">USB</button>
+	<button title="amplitude modulation" id="am">AM</button>
+
+	<div class="volume">
+		<p>Volume:</p>
+		<input type="range" id="volume" name="volume" min="0" max="100" value="0">
+	</div>
+
+	<div class="gain">
+		<p>Gain:</p>
+		<input type="range" id="gain" name="gain" min="0" max="100" value="0">
+		<p>
+			(Adjusts volume serverside, use to minimize clipping.)
+		</p>
+	</div>
+
+	<div class="bandwidth">
+		<p>Bandwidth:</p>
+		<input type="range" id="bandwidth" name="bandwidth" min="10" max="100" value="100">
+		<span id="bandwidth-display" style="white-space: nowrap;"></span>
+	</div>
+</div>
+
+<div id="selector" class="selector" style="position:relative">
+	<div id="tuner" class="passband" style="position:absolute">
+		<div id="carrier" class="carrier-bar"></div>
+	</div>
+</div>
+
+<div id="labels" class="x-labels" style="position:relative"></div>
+<canvas style="background-color: #000000;" id="waterfall" width="1024" height="400" style="position:absolute"></canvas>
+
+
+<style>
+.tuner {
+    display: flex;
+    align-items: center;
+    border: 0px solid #ccc;
+    padding: 0px; 
+    width: 250px;
+}
+
+.volume {
+    display: flex;
+    align-items: center;
+    border: 0px solid #ccc;
+    padding: 0px; 
+    width: 250px;
+}
+
+.gain {
+    display: flex;
+    align-items: center;
+    border: 0px solid #ccc;
+    padding: 0px; 
+    width: 550px;
+}
+
+.bandwidth {
+    display: flex;
+    align-items: center;
+    border: 0px solid #ccc;
+    padding: 0px; 
+    width: 250px;
+}
+
+.tuner-body {
+    border: 1px solid #ccc;
+    padding: 0px; 
+    width: 550px;
+}
+
+.selector {
+	height: 40px;           
+    width: 1024px;            
+    background-color: #000438; 
+    border: 0px solid white; 
+    padding: 0px;           
+    color: white;            
+}
+
+.carrier-bar {
+	height: 40px;           
+    width: 2px;            
+    background-color: red; 
+    border: 0px solid white; 
+    padding: 0px;           
+    color: white;
+	margin: auto;
+}
+
+.passband {
+	height: 40px;           
+    width: 40px;            
+    background-color: #005080; 
+    border: 0px solid white; 
+    padding: 0px;           
+    color: white;            
+}
+
+.x-labels {
+	height: 20px;           
+    width: 1024px;            
+    background-color: black; 
+    border: 0px solid white; 
+    padding: 0px;           
+    color: white;            
+}
+</style>
+
+<script>
+const waterfallSize = 1024;
+const EXT_BLOCKLEN = 512 * 31;
+const AF_BLOCKLEN = 256 * 10;
+const localOscillatorFreq = 7106000;
+const sampleRate = 772300;
+var demodMode = 0; //0 am, 1 lsb, 2 usb
+var maxBandwidths = [24000, 6000, 6000];
+var bandwidth = 24000;
+var bandwidthMultiplier = 1;
+var tuneFreq = 7074030;
+
+var audioContext = null;
+var worklet = null;
+var packet = new Float32Array([demodMode, tuneFreq - localOscillatorFreq, 1000, 0]);
+const socket = new WebSocket("ws://localhost:40800");
+const am = document.getElementById("am");
+const lsb = document.getElementById("lsb");
+const usb = document.getElementById("usb");
+const labels = document.getElementById("labels");
+const waterfall = document.getElementById("waterfall");
+const passband = document.getElementById("tuner");
+const bandwidthSlider = document.getElementById("bandwidth");
+const selector = document.getElementById("selector");
+const volume = document.getElementById("volume");
+const gainSlider = document.getElementById("gain"); 
+const carrier = document.getElementById("carrier");
+const tunerInput = document.getElementById("tuned-frequency");
+const bandwidthDisplay = document.getElementById("bandwidth-display");
+const waterfallContext = waterfall.getContext("2d");
+
+const bounds = new Float32Array([0, 1]);
+var previousBounds = new Float32Array([0, 0.01]);
+const labelsArray = [];
+
+var gain = null;
+
+var selectorMousePos = { x: 0, y: 0 };
+var mousePos = { x: 0, y: 0 };
+var previousMousePos = { x: 0, y: 0 };
+var mouseDownPos = { x: 0, y: 0 };
+var boundsMouseDown = new Float32Array([0., 1]);
+var canZoom = false;
+var mouseDown = false;
+var selectorMouseDown = false;
+var keys = {37: 1, 38: 1, 39: 1, 40: 1};
+
+tunerInput.value = tuneFreq / 1000;
+
+for (var i = 0; i < 20; i++) {
+	var span = document.createElement("span");
+	span.textContent = i * 10 + 1100;
+	span.style.position = "absolute";
+	span.style.whiteSpace = "pre";
+	span.style.fontSize = "10px";
+	span.style.top = "0px";
+	span.style.left = i * 51.2 + "px";
+	labels.appendChild(span);
+	labelsArray.push(span);
+}
+
+function preventDefault(e) {
+  e.preventDefault();
+}
+
+function preventDefaultForScrollKeys(e) {
+  if (keys[e.keyCode]) {
+    preventDefault(e);
+    return false;
+  }
+}
+
+var supportsPassive = false;
+try {
+  window.addEventListener("test", null, Object.defineProperty({}, "passive", {
+    get: function () { supportsPassive = true; } 
+  }));
+} catch(e) {}
+
+var wheelOpt = supportsPassive ? { passive: false } : false;
+var wheelEvent = "onwheel" in document.createElement("div") ? "wheel" : "mousewheel";
+
+function clamp(x, lower, upper) {
+	return Math.min(upper, Math.max(lower, x))
+}
+
+function lerp(x, y, a) {
+	return x * (1 - a) + y * a;
+}
+
+function remap(lower, upper, x) {
+	return clamp((x - lower) / (upper - lower), 0, 1);
+}
+
+function truncateDecimal(number, digits) {
+  var multiplier = Math.pow(10, digits);
+  return Math.trunc(number * multiplier) / multiplier;
+}
+
+async function decompressGzip(gzippedBlob) {
+	try {
+		var decompressionStream = new DecompressionStream("gzip");
+		var decompressedStream = gzippedBlob.stream().pipeThrough(decompressionStream);
+		var response = await new Response(decompressedStream);
+		return response.blob();
+	} catch (error) {
+		throw error;
+	}
+}
+
+async function blobToByteArray(blob) {
+	try {
+		const buffer = await blob.arrayBuffer();
+		return new Uint8Array(buffer);
+	} catch (error) {
+		throw error;
+	}
+}
+
+function getFrequencyFromNormPos(x) {
+	var binIndex = Math.floor(x * EXT_BLOCKLEN);
+	return binIndex < EXT_BLOCKLEN / 2 ? -((EXT_BLOCKLEN / 2 - binIndex) * sampleRate) / EXT_BLOCKLEN : ((binIndex - EXT_BLOCKLEN / 2) * sampleRate) / EXT_BLOCKLEN;
+}
+
+function updatePassband() {
+	var upperSliceFreq = getFrequencyFromNormPos(bounds[1]);
+	var lowerSliceFreq = getFrequencyFromNormPos(bounds[0]);
+	var windowBandwidth = upperSliceFreq - lowerSliceFreq;
+	var hzPerPixel = windowBandwidth / waterfallSize;
+	var passbandVisualizerSize = Math.floor((bandwidth / windowBandwidth) * waterfallSize);
+
+	passband.style.width = passbandVisualizerSize + "px";
+	
+	if (demodMode == 0) {
+		var passbandPosition = Math.floor((tuneFreq - (lowerSliceFreq + localOscillatorFreq)) / hzPerPixel - passbandVisualizerSize / 2);
+		passband.style.left = passbandPosition + "px";	
+		carrier.style.marginLeft = "auto";
+		carrier.style.marginRight = "auto";
+	} else if(demodMode == 1) {
+		var passbandPosition = Math.floor((tuneFreq - (lowerSliceFreq + localOscillatorFreq)) / hzPerPixel - passbandVisualizerSize);
+		passband.style.left = passbandPosition + "px";	
+		carrier.style.margin = "0";
+		carrier.style.marginLeft = "auto";
+		carrier.style.marginRight = "0";
+	} else if(demodMode == 2) {
+		var passbandPosition = Math.floor((tuneFreq - (lowerSliceFreq + localOscillatorFreq)) / hzPerPixel);
+		passband.style.left = passbandPosition + "px";	
+		carrier.style.margin = "0";
+		carrier.style.marginLeft = "0";
+		carrier.style.marginRight = "auto";	
+	}
+	
+	bandwidthDisplay.textContent = truncateDecimal(bandwidth / 1000, 2) + " kHz";
+}
+
+updatePassband();
+
+function updateLabels() {
+	for (var i = 0; i < labelsArray.length; i++) {
+		var range = bounds[1] - bounds[0];
+		var label = labelsArray[i];
+		var posXNorm = (i * 51.2 / waterfallSize) * range + bounds[0];
+		var frequency = getFrequencyFromNormPos(posXNorm);
+		label.textContent = truncateDecimal((localOscillatorFreq + frequency) / 1000, 1) + "\n|";
+	}
+}
+
+updateLabels();
+
+function colormap(x) {
+	var a1 = remap(0, 0.25, x);
+	var a2 = remap(0.25, 0.5, x);
+	var a3 = remap(0.5, 0.75, x);
+	var a4 = remap(0.75, 1, x);
+	
+	var colorR = 0;
+	colorR = lerp(colorR, 0.2, a1);
+	colorR = lerp(colorR, 0.9, a2);
+	colorR = lerp(colorR, 1, a3);
+	colorR = lerp(colorR, 1, a4);
+	
+	var colorG = 0;
+	colorG = lerp(colorG, 0.2, a1);
+	colorG = lerp(colorG, 0.1, a2);
+	colorG = lerp(colorG, 1, a3);
+	colorG = lerp(colorG, 1, a4);
+	
+	var colorB = 0;
+	colorB = lerp(colorB, 0.7, a1);
+	colorB = lerp(colorB, 0, a2);
+	colorB = lerp(colorB, 0.3, a3);
+	colorB = lerp(colorB, 1, a4);
+	
+	return [colorR, colorG, colorB];
+}
+
+function updateWaterfall(waterfallValues, width) {
+    const imageData = waterfallContext.createImageData(width, 1);
+    const data = imageData.data; 
+	
+    for (var i = waterfallValues.length - 1; i >= 0; i--) {
+        var intensity = clamp((waterfallValues[i]) / 255, 0, 1);
+		var color = colormap(intensity);
+		
+        data[i * 4] = clamp(color[0] * 255, 0, 255);   
+        data[i * 4 + 1] = clamp(color[1] * 255, 0, 255);     
+        data[i * 4 + 2] = clamp(color[2] * 255, 0, 255);    
+        data[i * 4 + 3] = 255;       
+    }
+	
+	waterfallContext.drawImage(waterfall, 0, 0, waterfall.width, waterfall.height, 0, 1, waterfall.width, waterfall.height);
+    waterfallContext.putImageData(imageData, 0, 0);
+}
+
+function update() {	
+	var deltaMousePosX = mousePos.x - previousMousePos.x;
+		
+	if (mouseDown) {
+		var range = boundsMouseDown[1] - boundsMouseDown[0];
+		var drag = (mouseDownPos.x / waterfallSize - boundsMouseDown[0]) - (mousePos.x / waterfallSize - boundsMouseDown[0]);
+		
+		if (!(deltaMousePosX < 0 && bounds[1] >= 0.96) && !(deltaMousePosX > 0 && bounds[0] <= 0.03)) {
+			bounds[0] = boundsMouseDown[0] + drag * range;
+			bounds[1] = boundsMouseDown[1] + drag * range;
+		}
+		
+		updateLabels();
+		updatePassband();
+	}
+	
+	if (selectorMouseDown) {
+		var range = bounds[1] - bounds[0];
+		var selectorMousePosNorm = (selectorMousePos.x / waterfallSize) * range + bounds[0];
+		tuneFreq = localOscillatorFreq + getFrequencyFromNormPos(selectorMousePosNorm);
+		
+		tunerInput.value = truncateDecimal(tuneFreq / 1000, 2);
+		
+		if (demodMode == 0) {
+			passband.style.left = (selectorMousePos.x - tuner.getBoundingClientRect().width / 2) + "px";
+		} else if (demodMode == 1) {
+			passband.style.left = (selectorMousePos.x - tuner.getBoundingClientRect().width) + "px";
+		} else if (demodMode == 2) {
+			passband.style.left = selectorMousePos.x + "px";
+		}
+	}
+	
+	previousMousePos = mousePos;
+}
+
+function updateBandwidth(event) {
+	if (event) bandwidthMultiplier = this.value / 100;
+	bandwidth = maxBandwidths[demodMode] * bandwidthMultiplier;
+	updatePassband();
+}
+
+socket.addEventListener("open", (event) => {
+    console.log("connected to websdr server");
+});
+
+var bytes = 0;
+
+socket.addEventListener("message", (event) => {	
+	bytes += event.data.size;
+	decompressGzip(event.data).then(decompressed => {
+		blobToByteArray(decompressed).then(data => {	
+			if (data.length == 1024) { 
+				updateWaterfall(data, waterfallSize);
+			} else if (audioContext) {
+				data = new Int8Array(data.buffer);
+				worklet.port.postMessage({ pcm: data });
+			}
+		}).catch(error => { console.log(error) });
+	}).catch(error => { console.log(error) });
+});
+
+setInterval(function() {
+	console.log((bytes * 8) / 1000 + " kbps");
+	bytes = 0;
+}, 1000);
+
+bandwidthSlider.addEventListener("input", updateBandwidth);
+
+volume.addEventListener("input", function() {
+	if(audioContext) gain.gain.value = this.value / 100.0;
+});
+
+selector.onmousedown = function() {
+	selectorMouseDown = true;
+}
+
+selector.onmouseup = function() {
+	selectorMouseDown = false;
+}
+
+selector.addEventListener("mousemove", function(event) {
+    var rect = selector.getBoundingClientRect();
+    var x = event.clientX - rect.left;
+    var y = event.clientY - rect.top;
+
+    selectorMousePos = { x: x, y: y };
+}, false);
+
+waterfall.addEventListener("wheel", function(event) {
+	var range = bounds[1] - bounds[0];
+	
+	if (event.deltaY < 0 && range > 0.2 && canZoom) {
+		var normalizedX = mousePos.x / waterfallSize;
+		
+		bounds[0] += 0.01;
+		bounds[1] -= 0.01;
+		
+		var newRange = bounds[1] - bounds[0];
+		var newMouseX = (normalizedX - bounds[0]) / newRange;
+		var distance = newMouseX - normalizedX;
+		
+		distance = clamp(distance, -0.01, 0.01);
+		
+		bounds[0] += distance;
+		bounds[1] += distance;
+		bounds[0] = clamp(bounds[0], 0, 1);
+		bounds[1] = clamp(bounds[1], 0, 1);
+	} else if(event.deltaY > 0 && range < 1.0 && canZoom) {
+		var normalizedX = mousePos.x / waterfallSize;
+		
+		bounds[0] -= 0.01;
+		bounds[1] += 0.01;
+		
+		var newRange = bounds[1] - bounds[0];
+		var newMouseX = (normalizedX - bounds[0]) / newRange;
+		var distance = newMouseX - normalizedX;
+		
+		distance = clamp(distance, -0.01, 0.01);
+		
+		bounds[0] += distance
+		bounds[1] += distance;
+		bounds[0] = clamp(bounds[0], 0, 1);
+		bounds[1] = clamp(bounds[1], 0, 1);
+	}
+	
+	updateLabels();
+	updatePassband(bandwidth);
+});
+
+waterfall.onmousedown = function() {
+	mouseDown = true;
+	mouseDownPos = mousePos;
+	boundsMouseDown = Array.from(bounds);
+}
+
+waterfall.onmouseup = function() {
+	mouseDown = false;
+}
+
+waterfall.addEventListener("mouseenter", function () {
+	canZoom = true;
+	window.addEventListener("DOMMouseScroll", preventDefault, false);
+	window.addEventListener(wheelEvent, preventDefault, wheelOpt); 
+	window.addEventListener("touchmove", preventDefault, wheelOpt); 
+	window.addEventListener("keydown", preventDefaultForScrollKeys, false);
+});
+
+waterfall.addEventListener("mouseleave", function () {
+	canZoom = false;
+	window.removeEventListener("DOMMouseScroll", preventDefault, false);
+	window.removeEventListener(wheelEvent, preventDefault, wheelOpt); 
+	window.removeEventListener("touchmove", preventDefault, wheelOpt);
+	window.removeEventListener("keydown", preventDefaultForScrollKeys, false);
+});
+
+waterfall.addEventListener("mousemove", function(event) {
+    var rect = waterfall.getBoundingClientRect();
+    var x = event.clientX - rect.left;
+    var y = event.clientY - rect.top;
+
+    mousePos = { x: x, y: y };
+});
+
+tunerInput.addEventListener("keyup", (event) => {
+	var freq = Number(tunerInput.value);
+	
+	if (freq == freq && event.keyCode == 13) {
+		tuneFreq = freq * 1000;
+		updatePassband();
+	}
+});
+
+am.addEventListener("click", () => {
+	demodMode = 0;
+	updatePassband();
+	updateBandwidth(null);
+});
+
+lsb.addEventListener("click", () => {
+	demodMode = 1;
+	updatePassband();
+	updateBandwidth(null);
+});
+
+usb.addEventListener("click", () => {
+	demodMode = 2;
+	updatePassband();
+	updateBandwidth(null);
+});
+
+setInterval(update, 1);
+
+setInterval(function() {
+	if (bounds[0] != previousBounds[0] || bounds[1] != previousBounds[1]) {
+		socket.send(new Blob([bounds], { type: "octet/stream" }));
+	}
+	
+	previousBounds = new Float32Array(bounds);
+}, 200);
+
+setInterval(function() {
+	var diff = tuneFreq - localOscillatorFreq;
+	
+	if (packet[0] != demodMode || Math.abs(packet[1] - diff) > 0.02 || packet[2] != bandwidth || packet[3] != gainSlider.value) {
+		packet = new Float32Array([demodMode, diff, bandwidth, gainSlider.value]);
+		socket.send(new Blob([packet], { type: "octet/stream" }));
+	}
+}, 100);
+
+async function initAudioContext() {
+    if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({sampleRate: 12400});
+		audioContext.resume();
+		
+		gain = audioContext.createGain();
+		gain.gain.value = 0;
+		gain.connect(audioContext.destination);
+		
+		var blob = new Blob([`
+			class pcmPlay extends AudioWorkletProcessor {
+				constructor() {
+					super();
+					
+					this.queue = [];
+				    
+					this.port.onmessage = (event) => {
+						var data = event.data.pcm;
+						
+						if (data instanceof Int8Array) {
+							var dataNorm = Float32Array.from({length: data.length});
+							
+							for (var i = 0; i < data.length; i++) {
+								dataNorm[i] = data[i] / 0x7F;
+							}
+							
+							this.queue.push(dataNorm);
+						}
+					}
+				}
+				
+				process(_, outputs) {
+					var output = outputs[0];
+					var outputChannel = output[0];
+					var availableLength = outputChannel.length;
+					var offset = 0;
+
+					while (availableLength > 0 && this.queue.length > 0) {
+						var currentBuffer = this.queue[0];	
+						var copyLength = Math.min(availableLength, currentBuffer.length);
+						
+						outputChannel.set(currentBuffer.subarray(0, copyLength), offset);
+						availableLength -= copyLength;
+						offset += copyLength;
+							
+						if (copyLength === currentBuffer.length) {
+							this.queue.shift();
+						} else {
+							this.queue[0] = currentBuffer.subarray(copyLength);
+						}
+					}
+						
+					if (availableLength > 0) {
+						outputChannel.subarray(offset).fill(0);
+					}
+					
+					if (this.queue.length > 4) {
+						this.queue.length = 0;
+					}
+        
+					return true; 
+				}
+			}
+			
+			registerProcessor("processor", pcmPlay);
+		`], { type: "application/javascript" });
+		
+		await audioContext.audioWorklet.addModule(URL.createObjectURL(blob));
+		worklet = new AudioWorkletNode(audioContext, "processor");
+		worklet.connect(gain);
+		console.log("audio started");
+    }
+}
+
+document.getElementById("start-audio").addEventListener("click", () => {
+    initAudioContext();
+});
+
+
+</script>
+
+</html>
