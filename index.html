@@ -553,7 +553,9 @@ setInterval(update, 1);
 
 setInterval(function() {
 	if (bounds[0] != previousBounds[0] || bounds[1] != previousBounds[1]) {
-		socket.send(new Blob([bounds], { type: "octet/stream" }));
+		var blob = new Blob([bounds], { type: "octet/stream" });
+		bytes += blob.size;
+		socket.send(blob);
 	}
 	
 	previousBounds = new Float32Array(bounds);
@@ -564,7 +566,10 @@ setInterval(function() {
 	
 	if (packet[0] != demodMode || Math.abs(packet[1] - diff) > 0.02 || packet[2] != bandwidth || packet[3] != gainSlider.value) {
 		packet = new Float32Array([demodMode, diff, bandwidth, gainSlider.value]);
-		socket.send(new Blob([packet], { type: "octet/stream" }));
+		
+		var blob = new Blob([packet], { type: "octet/stream" });
+		bytes += blob.size;
+		socket.send(blob);
 	}
 }, 100);
 
